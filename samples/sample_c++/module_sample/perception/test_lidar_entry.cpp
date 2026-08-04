@@ -24,6 +24,8 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "test_lidar_entry.hpp"
+#include "lidar_quality_pipeline.hpp"
+#include "lidar_rgb_overlay_bridge.hpp"
 #include <dirent.h>
 #include "dji_logger.h"
 #include <iostream>
@@ -40,12 +42,22 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <queue>
+#include <vector>
+#include <cstdlib>
+#include <algorithm>
+#include <chrono>
 /* Private constants ---------------------------------------------------------*/
 #define PCD_FILE_DEFAULT_LENGTH                 (512)
 #define FRAME_BUFFER_LENGTH                     (1024 * 1024)
 #define SUBSCRIBE_DATA_TIME_MS                  (1000 * 10)
 #define USER_PERCEPTION_LIRDAR_TASK_STACK_SIZE  (2042)
 #define PCD_FILE_PATH                           "./DJI_cloud_data"
+#define LIDAR_FRAME_QUEUE_LIMIT                 (2)
+#define LIDAR_QUALITY_POINT_LIMIT               (200000)
+
+#ifndef DJI_LIDAR_QUALITY_WRITE_PCD
+#define DJI_LIDAR_QUALITY_WRITE_PCD             (0)
+#endif
 
 /* Private types -------------------------------------------------------------*/
 
@@ -56,6 +68,14 @@ static T_DjiMutexHandle queueMutex;
 static T_DjiSemaHandle dataSemaphore;
 static bool stopProcessing = false;
 static T_DjiSemaHandle taskExitSema;
+static uint32_t droppedByBackpressure = 0;
+static dji_lidar_quality::Pipeline qualityPipeline;
+
+static uint64_t DjiTest_HostTimestampNs() {
+    const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        now.time_since_epoch()).count());
+}
 
 /* Private functions declaration ---------------------------------------------*/
 static void DjiTest_PerceptionLidarCallback(uint8_t *recvBuffer, uint32_t bufferLen);
@@ -63,27 +83,54 @@ static std::string DjiTest_getCurrentTimestamp();
 static void DjiTest_WriteLidarFrameToBinaryPcdFile(const T_DjiLidarFrame *frame);
 static void* DjiTest_ProcessLidarDataTask(void* arg);
 
+static const std::size_t kLidarPkgCapacity = sizeof(((T_DjiLidarFrame *)0)->pkgs) /
+                                              sizeof(((T_DjiLidarFrame *)0)->pkgs[0]);
+static const std::size_t kLidarPointCapacity = sizeof(((T_DjiPerceptionLidarDecodePkg *)0)->points) /
+                                               sizeof(((T_DjiPerceptionLidarDecodePkg *)0)->points[0]);
+
 /* Exported functions definition ---------------------------------------------*/
 void DjiUser_RunLidarDataSubscriptionSample(void) {
     int subscriptionDuration = 10;
     lastFrameCnt = 0;
+    droppedByBackpressure = 0;
+    stopProcessing = false;
+    qualityPipeline.Reset();
+    const char *calibrationPath = std::getenv("DJI_L3_RGB_CALIBRATION");
+    if (calibrationPath && dji_lidar_quality::LoadRgbCalibrationFile(calibrationPath)) {
+        std::cout << "RGB overlay calibration loaded from DJI_L3_RGB_CALIBRATION" << std::endl;
+    } else {
+        std::cout << "RGB overlay disabled until DJI_L3_RGB_CALIBRATION is valid" << std::endl;
+    }
     T_DjiOsalHandler *osalHandler = DjiPlatform_GetOsalHandler();
 
     osalHandler->MutexCreate(&queueMutex);
     osalHandler->SemaphoreCreate(0, &dataSemaphore);
     osalHandler->SemaphoreCreate(0, &taskExitSema);
 
-    std::cout << "Please ensure that there is enough storage space for the PCD files." << std::endl;
+#if DJI_LIDAR_QUALITY_WRITE_PCD
+    std::cout << "PCD recording is enabled. Please ensure that there is enough storage space." << std::endl;
+#else
+    std::cout << "Resource-bounded LiDAR quality analysis enabled; per-frame PCD writing disabled." << std::endl;
+#endif
 
     T_DjiTaskHandle processingThread;
-    osalHandler->TaskCreate("LidarProcessingThread", DjiTest_ProcessLidarDataTask, USER_PERCEPTION_LIRDAR_TASK_STACK_SIZE, nullptr, &processingThread);
+    T_DjiReturnCode taskReturnCode = osalHandler->TaskCreate(
+        "LidarProcessingThread", DjiTest_ProcessLidarDataTask,
+        USER_PERCEPTION_LIRDAR_TASK_STACK_SIZE, nullptr, &processingThread);
+    if (taskReturnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        std::cout << "Lidar processing task creation failed" << std::endl;
+        osalHandler->MutexDestroy(queueMutex);
+        osalHandler->SemaphoreDestroy(dataSemaphore);
+        osalHandler->SemaphoreDestroy(taskExitSema);
+        return;
+    }
 
 start:
     T_DjiReturnCode returnCode;
     returnCode = DjiPerception_Init();
     if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         std::cout << "DjiPerception Init failed" << std::endl;
-        return;
+        goto shutdownProcessing;
     }
 
     std::cout << "start subscribe Lidar data from aircraft" << std::endl;
@@ -107,11 +154,11 @@ start:
     returnCode = DjiPerception_Deinit();
     if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         std::cout << "DjiPerception DeInit failed" << std::endl;
-        return;
     }
 
     std::cout << "unsubscribe Lidar data success" << std::endl;
 
+shutdownProcessing:
     osalHandler->MutexLock(queueMutex);
     stopProcessing = true;
     osalHandler->MutexUnlock(queueMutex);
@@ -126,16 +173,26 @@ start:
 
 /* Private functions definition-----------------------------------------------*/
 static void DjiTest_PerceptionLidarCallback(uint8_t *LidarFrame, uint32_t bufferLen) {
-    if (bufferLen != sizeof(T_DjiLidarFrame)) {
+    if (!LidarFrame || bufferLen != sizeof(T_DjiLidarFrame)) {
         std::cout << "usb recv Lidar length wrong, length = " << bufferLen << std::endl;
         return;
     }
 
     T_DjiOsalHandler *osalHandler = DjiPlatform_GetOsalHandler();
     T_DjiLidarFrame * curFrame =  (T_DjiLidarFrame *)osalHandler->Malloc(bufferLen);
+    if (!curFrame) {
+        std::cout << "Lidar frame allocation failed; dropping frame" << std::endl;
+        return;
+    }
     memcpy(curFrame, LidarFrame, bufferLen);
 
     osalHandler->MutexLock(queueMutex);
+    while (lidarFrameQueue.size() >= LIDAR_FRAME_QUEUE_LIMIT) {
+        T_DjiLidarFrame *oldest = lidarFrameQueue.front();
+        lidarFrameQueue.pop();
+        osalHandler->Free(oldest);
+        ++droppedByBackpressure;
+    }
     lidarFrameQueue.push(curFrame);
     osalHandler->MutexUnlock(queueMutex);
 
@@ -173,8 +230,9 @@ static void DjiTest_WriteLidarFrameToBinaryPcdFile(const T_DjiLidarFrame *frame)
         return;
     }
 
-    for (uint16_t i = 0; i < frame->pkgNum; ++i) {
-        totalPoints += frame->pkgs[i].header.dotNum;
+    const std::size_t pkgCount = std::min<std::size_t>(frame->pkgNum, kLidarPkgCapacity);
+    for (std::size_t i = 0; i < pkgCount; ++i) {
+        totalPoints += std::min<std::size_t>(frame->pkgs[i].header.dotNum, kLidarPointCapacity);
     }
 
     snprintf(header, sizeof(header),
@@ -205,9 +263,10 @@ static void DjiTest_WriteLidarFrameToBinaryPcdFile(const T_DjiLidarFrame *frame)
     memcpy(buffer + bufferPos, header, headerLen);
     bufferPos += headerLen;
 
-    for (uint16_t i = 0; i < frame->pkgNum; ++i) {
+    for (std::size_t i = 0; i < pkgCount; ++i) {
         const T_DjiPerceptionLidarDecodePkg *pkg = &frame->pkgs[i];
-        for (uint16_t j = 0; j < pkg->header.dotNum; ++j) {
+        const std::size_t pointCount = std::min<std::size_t>(pkg->header.dotNum, kLidarPointCapacity);
+        for (std::size_t j = 0; j < pointCount; ++j) {
             const T_DJIPerceptionLidarPoint *point = &pkg->points[j];
             memcpy(buffer + bufferPos, &point->x, sizeof(float));
             bufferPos += sizeof(float);
@@ -249,12 +308,53 @@ static void* DjiTest_ProcessLidarDataTask(void* arg) {
             osalHandler->MutexUnlock(queueMutex);
             break;
         }
+        if (lidarFrameQueue.empty()) {
+            osalHandler->MutexUnlock(queueMutex);
+            continue;
+        }
 
         T_DjiLidarFrame *lidarFrame = lidarFrameQueue.front();
         lidarFrameQueue.pop();
         osalHandler->MutexUnlock(queueMutex);
 
+#if DJI_LIDAR_QUALITY_WRITE_PCD
         DjiTest_WriteLidarFrameToBinaryPcdFile(lidarFrame);
+#endif
+
+        std::size_t rawPointCount = 0;
+        const std::size_t pkgCount = std::min<std::size_t>(lidarFrame->pkgNum, kLidarPkgCapacity);
+        for (std::size_t i = 0; i < pkgCount; ++i) {
+            rawPointCount += lidarFrame->pkgs[i].header.dotNum;
+        }
+        const std::size_t samplingStride = std::max<std::size_t>(
+            1, (rawPointCount + LIDAR_QUALITY_POINT_LIMIT - 1) / LIDAR_QUALITY_POINT_LIMIT);
+        std::vector<dji_lidar_quality::Point> qualityPoints;
+        qualityPoints.reserve(std::min<std::size_t>(rawPointCount, LIDAR_QUALITY_POINT_LIMIT));
+        std::size_t rawPointIndex = 0;
+        for (std::size_t i = 0; i < pkgCount; ++i) {
+            const T_DjiPerceptionLidarDecodePkg *pkg = &lidarFrame->pkgs[i];
+            const std::size_t pointCount = std::min<std::size_t>(pkg->header.dotNum, kLidarPointCapacity);
+            for (std::size_t j = 0; j < pointCount; ++j, ++rawPointIndex) {
+                if ((rawPointIndex % samplingStride) != 0 ||
+                    qualityPoints.size() >= LIDAR_QUALITY_POINT_LIMIT) {
+                    continue;
+                }
+                const T_DJIPerceptionLidarPoint *point = &pkg->points[j];
+                dji_lidar_quality::Point p;
+                p.x = point->x;
+                p.y = point->y;
+                p.z = point->z;
+                p.intensity = point->intensity;
+                p.label = point->label;
+                qualityPoints.push_back(p);
+            }
+        }
+
+        const dji_lidar_quality::Result quality = qualityPipeline.Process(
+            qualityPoints.data(), qualityPoints.size(), lidarFrame->timeStampNs, lidarFrame->frameCnt);
+        dji_lidar_quality::PublishLowDensityRegions(quality.lowDensityRegions, DjiTest_HostTimestampNs());
+        std::cout << "LIDAR_QUALITY " << quality.ToJson()
+                  << " backpressure_drops=" << droppedByBackpressure << std::endl;
 
         int curFrameCnt = lidarFrame->frameCnt;
         std::cout << "Lidar data : curFrameCnt=" << curFrameCnt << std::endl;
