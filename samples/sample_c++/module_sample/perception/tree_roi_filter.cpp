@@ -7,9 +7,15 @@ namespace dji_lidar_quality {
 namespace {
 
 static bool ValidCalibration(const RgbCalibration &c) {
-    return c.imageWidth > 0 && c.imageHeight > 0 && c.fx > 0.0f && c.fy > 0.0f &&
-           std::isfinite(c.fx) && std::isfinite(c.fy) &&
-           std::isfinite(c.cx) && std::isfinite(c.cy);
+    if (!(c.imageWidth > 0 && c.imageHeight > 0 && c.fx > 0.0f && c.fy > 0.0f &&
+          std::isfinite(c.fx) && std::isfinite(c.fy) &&
+          std::isfinite(c.cx) && std::isfinite(c.cy))) return false;
+    for (int i = 0; i < 9; ++i) if (!std::isfinite(c.rotation[i])) return false;
+    for (int i = 0; i < 3; ++i) if (!std::isfinite(c.translation[i])) return false;
+    const float det = c.rotation[0] * (c.rotation[4] * c.rotation[8] - c.rotation[5] * c.rotation[7]) -
+                      c.rotation[1] * (c.rotation[3] * c.rotation[8] - c.rotation[5] * c.rotation[6]) +
+                      c.rotation[2] * (c.rotation[3] * c.rotation[7] - c.rotation[4] * c.rotation[6]);
+    return std::isfinite(det) && std::fabs(det) > 0.5f && std::fabs(det) < 1.5f;
 }
 
 static bool ValidMask(const SegmentationMask &m) {

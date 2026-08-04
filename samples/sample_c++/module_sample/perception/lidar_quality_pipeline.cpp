@@ -214,6 +214,26 @@ Result Pipeline::Process(const Point *points, std::size_t pointCount,
                                             (cfg.voxelSizeM * cfg.voxelSizeM * cfg.voxelSizeM));
         out.lowDensityRegions.push_back(region);
     }
+    // Keep the lowest-density, spatially separated candidates first so the
+    // overlay identifies meaningful regions instead of arbitrary hash entries.
+    std::sort(out.lowDensityRegions.begin(), out.lowDensityRegions.end(),
+              [](const Result::LowDensityRegion &a, const Result::LowDensityRegion &b) {
+                  return a.pointCount < b.pointCount;
+              });
+    std::vector<Result::LowDensityRegion> separated;
+    separated.reserve(out.lowDensityRegions.size());
+    const float minCandidateDistance2 = cfg.supervoxelSizeM * cfg.supervoxelSizeM;
+    for (std::size_t i = 0; i < out.lowDensityRegions.size(); ++i) {
+        bool tooClose = false;
+        for (std::size_t j = 0; j < separated.size(); ++j) {
+            const float dx = out.lowDensityRegions[i].x - separated[j].x;
+            const float dy = out.lowDensityRegions[i].y - separated[j].y;
+            const float dz = out.lowDensityRegions[i].z - separated[j].z;
+            if (dx * dx + dy * dy + dz * dz < minCandidateDistance2) { tooClose = true; break; }
+        }
+        if (!tooClose) separated.push_back(out.lowDensityRegions[i]);
+    }
+    out.lowDensityRegions.swap(separated);
     std::unordered_map<Key, Accumulator, KeyHash> super;
     super.reserve(std::min(cfg.maxSupervoxels, impl_->voxels.size()));
     for (typename std::unordered_map<Key, Accumulator, KeyHash>::const_iterator it = impl_->voxels.begin();

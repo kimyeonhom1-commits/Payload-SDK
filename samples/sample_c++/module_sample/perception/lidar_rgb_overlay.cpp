@@ -2,15 +2,22 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 namespace dji_lidar_quality {
 namespace {
 
 static bool ValidCalibration(const RgbCalibration &c) {
-    return c.imageWidth > 0 && c.imageHeight > 0 &&
+    if (!(c.imageWidth > 0 && c.imageHeight > 0 &&
            c.fx > 0.0f && c.fy > 0.0f &&
            std::isfinite(c.fx) && std::isfinite(c.fy) &&
-           std::isfinite(c.cx) && std::isfinite(c.cy);
+           std::isfinite(c.cx) && std::isfinite(c.cy))) return false;
+    for (int i = 0; i < 9; ++i) if (!std::isfinite(c.rotation[i])) return false;
+    for (int i = 0; i < 3; ++i) if (!std::isfinite(c.translation[i])) return false;
+    const float det = c.rotation[0] * (c.rotation[4] * c.rotation[8] - c.rotation[5] * c.rotation[7]) -
+                      c.rotation[1] * (c.rotation[3] * c.rotation[8] - c.rotation[5] * c.rotation[6]) +
+                      c.rotation[2] * (c.rotation[3] * c.rotation[7] - c.rotation[4] * c.rotation[6]);
+    return std::isfinite(det) && std::fabs(det) > 0.5f && std::fabs(det) < 1.5f;
 }
 
 static std::uint8_t BlendRed(std::uint8_t old, std::uint8_t alpha) {
@@ -44,6 +51,9 @@ OverlayResult RgbOverlay::DrawLowDensity(
     result.timestampAligned = skew <= calibration_.maxTimestampSkewNs;
     if (!result.timestampAligned) return result;
 
+    struct ProjectedRegion { int x; int y; int radius; float depth; };
+    std::vector<ProjectedRegion> projected;
+    projected.reserve(std::min<std::size_t>(regions.size(), 128));
     const std::size_t maxRegions = std::min<std::size_t>(regions.size(), 128);
     for (std::size_t i = 0; i < maxRegions; ++i) {
         const Result::LowDensityRegion &region = regions[i];
@@ -62,6 +72,17 @@ OverlayResult RgbOverlay::DrawLowDensity(
             ++result.rejectedOutOfFrame;
             continue;
         }
+        projected.push_back(ProjectedRegion{px, py, r, pz3});
+    }
+
+    // Draw far regions first so a nearer LiDAR region wins when projections overlap.
+    std::sort(projected.begin(), projected.end(), [](const ProjectedRegion &a, const ProjectedRegion &b) {
+        return a.depth > b.depth;
+    });
+    for (std::size_t i = 0; i < projected.size(); ++i) {
+        const int px = projected[i].x;
+        const int py = projected[i].y;
+        const int r = projected[i].radius;
         const int minY = std::max(0, py - r), maxY = std::min(static_cast<int>(image->height) - 1, py + r);
         const int minX = std::max(0, px - r), maxX = std::min(static_cast<int>(image->width) - 1, px + r);
         for (int y = minY; y <= maxY; ++y) {
