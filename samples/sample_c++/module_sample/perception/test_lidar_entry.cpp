@@ -114,7 +114,16 @@ void DjiUser_RunLidarDataSubscriptionSample(void) {
 #endif
 
     T_DjiTaskHandle processingThread;
-    osalHandler->TaskCreate("LidarProcessingThread", DjiTest_ProcessLidarDataTask, USER_PERCEPTION_LIRDAR_TASK_STACK_SIZE, nullptr, &processingThread);
+    T_DjiReturnCode taskReturnCode = osalHandler->TaskCreate(
+        "LidarProcessingThread", DjiTest_ProcessLidarDataTask,
+        USER_PERCEPTION_LIRDAR_TASK_STACK_SIZE, nullptr, &processingThread);
+    if (taskReturnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        std::cout << "Lidar processing task creation failed" << std::endl;
+        osalHandler->MutexDestroy(queueMutex);
+        osalHandler->SemaphoreDestroy(dataSemaphore);
+        osalHandler->SemaphoreDestroy(taskExitSema);
+        return;
+    }
 
 start:
     T_DjiReturnCode returnCode;
