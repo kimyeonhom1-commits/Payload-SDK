@@ -30,6 +30,7 @@
 #include "dji_payload_camera.h"
 #include "dji_high_speed_data_channel.h"
 #include "dji_aircraft_info.h"
+#include "../perception/lidar_rgb_overlay_bridge.hpp"
 #include <string>
 #include <vector>
 #include "dji_typedef.h"
@@ -40,6 +41,7 @@
 #include <sstream>
 #include "dji_open_ar.h"
 #include <queue>
+#include <cstdlib>
 
 #ifdef OPEN_CV_INSTALLED
 #include <opencv2/opencv.hpp>
@@ -87,6 +89,12 @@ static void outH264Tofile(const uint8_t *buf, int32_t len);
 static void outYUVTofile(const uint8_t *buf, int32_t len);
 static void DjiLiveview_RcvImageCallback(E_DjiLiveViewCameraPosition position, const uint8_t *buf, uint32_t len ,T_DjiLiveviewImageInfo imageInfo);
 static void DjiLiveview_EncoderUseCallback(const uint8_t *buf, uint32_t len);
+
+static uint64_t DjiLiveview_HostTimestampNs() {
+    const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        now.time_since_epoch()).count());
+}
 
 #ifdef OPEN_CV_INSTALLED
 static ImageProcessorYolovFastest processor("YOLOvFastest");
@@ -381,6 +389,13 @@ void DjiUser_RunCameraAiDetectionSample()
 
     T_DjiOsalHandler *osalHandler = DjiPlatform_GetOsalHandler();
 
+    const char *calibrationPath = std::getenv("DJI_L3_RGB_CALIBRATION");
+    if (calibrationPath && dji_lidar_quality::LoadRgbCalibrationFile(calibrationPath)) {
+        USER_LOG_INFO("LiDAR RGB overlay calibration loaded");
+    } else {
+        USER_LOG_INFO("LiDAR RGB overlay disabled: calibration file is not available");
+    }
+
     USER_LOG_INFO("Input cammera sourece(1:1080p, 3:M4 serials 4K, 7:H30 serials 4K): ");
     std::cin >> mediaSource;
     if (pos < 1 || pos > 3 || mediaSource > 7)
@@ -552,9 +567,26 @@ static void DjiLiveview_RcvImageCallback(E_DjiLiveViewCameraPosition position, c
                   imageInfo.pixFmt ,imageInfo.height, imageInfo.width, imageInfo.frameId, len);
     T_DjiLiveViewStandardMetaData * metaData = nullptr;
     T_DjiOsalHandler *osalHandler = DjiPlatform_GetOsalHandler();
+    const uint8_t *frameBuf = buf;
+    static thread_local std::vector<uint8_t> overlayFrame;
+    if (imageInfo.pixFmt == PIXFMT_RGB_PACKED && dji_lidar_quality::HasRgbCalibration()) {
+        overlayFrame.resize(len);
+        memcpy(overlayFrame.data(), buf, len);
+        const dji_lidar_quality::OverlayResult overlayResult =
+            dji_lidar_quality::ApplyLatestOverlay(overlayFrame.data(), overlayFrame.size(),
+                                                  imageInfo.width, imageInfo.height, 3,
+                                                  DjiLiveview_HostTimestampNs());
+        if (overlayResult.projectedRegions > 0) {
+            frameBuf = overlayFrame.data();
+            USER_LOG_INFO("LiDAR RGB overlay: projected=%u rejected_depth=%u rejected_frame=%u",
+                          static_cast<unsigned>(overlayResult.projectedRegions),
+                          static_cast<unsigned>(overlayResult.rejectedBehindCamera),
+                          static_cast<unsigned>(overlayResult.rejectedOutOfFrame));
+        }
+    }
 
 #ifdef OPEN_CV_INSTALLED
-    cv::Mat rgb_image( imageInfo.height, imageInfo.width, CV_8UC3, const_cast<uint8_t*>(buf));
+    cv::Mat rgb_image( imageInfo.height, imageInfo.width, CV_8UC3, const_cast<uint8_t*>(frameBuf));
     cv::Mat rgb_image_copy = rgb_image.clone();
 
     osalHandler->MutexLock(s_imageQueueMutexHandle);
@@ -572,7 +604,7 @@ static void DjiLiveview_RcvImageCallback(E_DjiLiveViewCameraPosition position, c
     }
     osalHandler->MutexUnlock(s_metaQueueMutexHandle);
 
-    DjiLiveview_EncodeAFrameToH264(buf, len, imageInfo, metaData);
+    DjiLiveview_EncodeAFrameToH264(frameBuf, len, imageInfo, metaData);
     if(metaData != nullptr) free(metaData);
 
 #else
@@ -603,7 +635,7 @@ static void DjiLiveview_RcvImageCallback(E_DjiLiveViewCameraPosition position, c
 
     DjiLiveview_SendAiMetaToPilot(metaData);
 
-    DjiLiveview_EncodeAFrameToH264(buf, len,imageInfo, metaData);
+    DjiLiveview_EncodeAFrameToH264(frameBuf, len,imageInfo, metaData);
 #endif
 }
 
