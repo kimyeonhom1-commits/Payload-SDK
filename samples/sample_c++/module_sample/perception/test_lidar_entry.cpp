@@ -121,7 +121,7 @@ start:
     returnCode = DjiPerception_Init();
     if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         std::cout << "DjiPerception Init failed" << std::endl;
-        return;
+        goto shutdownProcessing;
     }
 
     std::cout << "start subscribe Lidar data from aircraft" << std::endl;
@@ -145,11 +145,11 @@ start:
     returnCode = DjiPerception_Deinit();
     if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         std::cout << "DjiPerception DeInit failed" << std::endl;
-        return;
     }
 
     std::cout << "unsubscribe Lidar data success" << std::endl;
 
+shutdownProcessing:
     osalHandler->MutexLock(queueMutex);
     stopProcessing = true;
     osalHandler->MutexUnlock(queueMutex);
