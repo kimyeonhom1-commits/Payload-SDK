@@ -76,6 +76,24 @@ static bool Finite(const Point &p) {
     return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z);
 }
 
+static Config SanitizeConfig(Config c) {
+    if (!(std::isfinite(c.voxelSizeM) && c.voxelSizeM > 0.001f)) c.voxelSizeM = 0.20f;
+    if (!(std::isfinite(c.supervoxelSizeM) && c.supervoxelSizeM >= c.voxelSizeM)) {
+        c.supervoxelSizeM = std::max(0.60f, c.voxelSizeM * 2.0f);
+    }
+    if (c.maxInputPoints == 0) c.maxInputPoints = 1;
+    if (c.maxActiveVoxels == 0) c.maxActiveVoxels = 1;
+    if (c.maxSupervoxels == 0) c.maxSupervoxels = 1;
+    if (c.minVoxelPoints == 0) c.minVoxelPoints = 1;
+    if (c.minSupervoxelPoints == 0) c.minSupervoxelPoints = 1;
+    if (!std::isfinite(c.minLinearity)) c.minLinearity = 0.55f;
+    if (!std::isfinite(c.minAxisAlignment)) c.minAxisAlignment = 0.55f;
+    c.minLinearity = std::max(0.0f, std::min(1.0f, c.minLinearity));
+    c.minAxisAlignment = std::max(0.0f, std::min(1.0f, c.minAxisAlignment));
+    if (!(std::isfinite(c.maxLinkDistanceM) && c.maxLinkDistanceM > 0.0f)) c.maxLinkDistanceM = 1.20f;
+    return c;
+}
+
 static Node MakeNode(const Key &key, const Accumulator &a) {
     Node n;
     n.cell = key;
@@ -138,8 +156,8 @@ struct Pipeline::Impl {
     std::uint32_t lastDecayFrame = 0;
 };
 
-Pipeline::Pipeline(const Config &config) : impl_(new Impl(config)) {
-    impl_->voxels.reserve(config.maxActiveVoxels);
+Pipeline::Pipeline(const Config &config) : impl_(new Impl(SanitizeConfig(config))) {
+    impl_->voxels.reserve(impl_->config.maxActiveVoxels);
 }
 
 Pipeline::~Pipeline() { delete impl_; }
